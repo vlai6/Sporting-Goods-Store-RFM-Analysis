@@ -1,0 +1,149 @@
+---
+title: "Sporting Goods Store RFM and CLV Analysis"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+# data source: https://www.kaggle.com/datasets/cnezhmar/sporting-goods-store?resource=download
+
+```{r}
+# Load Packages
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(car)
+```
+
+```{r}
+# Load datasets
+customers <- read_excel("Customer.xlsx")
+sales <- read_excel("Sales.xlsx")
+product <- read_excel("Product.xlsx")
+territories <- read_excel("Territories.xlsx")
+```
+
+```{r}
+# OrderDate column into Date format
+sales <- sales %>%
+  mutate(OrderDate = as.Date(OrderDate))
+
+# join sales with customers and territories datasets
+# filter for sales only in the United States
+sales_data_us <- sales %>%
+  left_join(customers, by = "CustomerKey") %>%
+  left_join(territories, by = "SalesTerritoryKey") %>%
+  filter(Country == "United States")
+
+# make analysis date 1 day after latest transaction 
+analysis_date <- max(sales_data_us$OrderDate, na.rm = TRUE) + 1
+```
+
+```{r}
+# RFM
+rfm <- sales_data_us %>%
+  group_by(CustomerKey) %>%
+  summarise(
+    Recency = as.numeric(analysis_date - max(OrderDate, na.rm = TRUE)),
+    Frequency = n_distinct(SalesOrderNumber),  # Count of unique orders
+    Monetary = sum(SalesAmount, na.rm = TRUE)
+  )
+
+rfm <- rfm %>%
+  mutate(
+    R_Score = ntile(-Recency, 5),   # Q1 = Least recent, Q5 = Most recent
+    F_Score = ntile(Frequency, 5),  # Q1 = Least frequent, Q5 = Most frequent
+    M_Score = ntile(Monetary, 5),   # Q1 = Least total spent, Q5 = Most total spent
+    RFM_Score = R_Score * 100 + F_Score * 10 + M_Score  # Optional combined score
+  )
+
+head(rfm)
+```
+
+```{r}
+# CLV Calculation (Basic Total Revenue Approach)
+
+clv <- sales_data_us %>%
+  group_by(CustomerKey) %>%
+  summarise(
+    CLV_TotalRevenue = sum(SalesAmount, na.rm = TRUE),            # total lifetime spend
+    FirstPurchase = min(OrderDate, na.rm = TRUE),
+    LastPurchase = max(OrderDate, na.rm = TRUE),
+    NumOrders = n_distinct(SalesOrderNumber),                      # frequency of orders
+    AvgOrderValue = CLV_TotalRevenue / NumOrders
+  ) %>%
+  mutate(
+    LifespanDays = as.numeric(LastPurchase - FirstPurchase),
+    LifespanMonths = LifespanDays / 30.44,  # rough average month
+    MonthlyValue = ifelse(LifespanMonths > 0, CLV_TotalRevenue / LifespanMonths, CLV_TotalRevenue)
+  )
+```
+
+```{r}
+clv_segmented <- clv %>%
+  mutate(
+    CLV_Quintile = ntile(CLV_TotalRevenue, 5),  # Q1 = lowest CLV, Q5 = highest
+    CLV_Segment = case_when(
+      CLV_Quintile == 5 ~ "Top 20% (High CLV)",
+      CLV_Quintile == 4 ~ "Upper-Mid",
+      CLV_Quintile == 3 ~ "Middle",
+      CLV_Quintile == 2 ~ "Lower-Mid",
+      TRUE              ~ "Bottom 20% (Low CLV)"
+    )
+  )
+
+```
+
+```{r}
+# Visualize CLV
+
+library(ggplot2)
+
+ggplot(clv_segmented, aes(x = CLV_TotalRevenue)) +
+  geom_histogram(bins = 30, fill = "steelblue") +
+  labs(title = "Distribution of Customer Lifetime Value", x = "CLV", y = "Number of Customers")
+
+```
+
+```{r}
+rfm_clv <- rfm %>%
+  left_join(clv, by = "CustomerKey")
+
+rfm_clv %>%
+  select(Recency, Frequency, Monetary, CLV_TotalRevenue) %>%
+  cor(use = "complete.obs")
+
+model <- lm(CLV_TotalRevenue ~ Recency + Frequency + Monetary, data = rfm_clv)
+summary(model)
+
+```
+
+```{r}
+rfm_clv_segmented <- rfm %>%
+  left_join(clv_segmented, by = "CustomerKey")
+
+# Customers in Top CLV Quintile
+top_clv_customers <- rfm_clv_segmented %>%
+  filter(CLV_Quintile == 5) %>%
+  select(CustomerKey)
+
+# Customers with RFM Score at least 444
+top_rfm_customers <- rfm_clv_segmented %>%
+  filter(R_Score >= 4, F_Score >= 4, M_Score >= 4) %>%
+  select(CustomerKey)
+
+# Customers who are in both Top RFM and CLV
+top_both_customers <- rfm_clv_segmented %>%
+  filter(R_Score >= 4, F_Score >= 4, M_Score >= 4, CLV_Quintile == 5) %>%
+  select(CustomerKey)
+
+```
+
+```{r}
+vif(model) # check for multicollinearity (not an issue here)
+```
+
+```{r}
+# Write a CSV of the segmented data
+write.csv(rfm_clv_segmented, "rfm_clv_segmented.csv", row.names = FALSE)
+```
+
